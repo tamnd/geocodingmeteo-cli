@@ -1,0 +1,10 @@
+title       = "geocodingmeteo"
+baseURL     = "https://geocodingmeteo-cli.tamnd.com/"
+description = "A command line for geocodingmeteo."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/geocodingmeteo-cli"
