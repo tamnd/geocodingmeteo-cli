@@ -2,8 +2,7 @@ package geocodingmeteo
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"unicode"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
@@ -19,9 +18,6 @@ import (
 // geocodingmeteo:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone geocodingmeteo binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the geocodingmeteo driver. It carries no state; the per-run client is
@@ -36,36 +32,42 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "geocodingmeteo",
-			Short:  "A command line for geocodingmeteo.",
-			Long: `A command line for geocodingmeteo.
+			Short:  "Search cities and locations via the Open-Meteo Geocoding API.",
+			Long: `Search cities and locations via the Open-Meteo Geocoding API.
 
-geocodingmeteo reads public geocodingmeteo data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+geocodingmeteo reads public Open-Meteo geocoding data over plain HTTPS, shapes
+it into clean records, and prints output that pipes into the rest of your tools.
+No API key, nothing to run alongside it.`,
+			Site: "geocoding-api.open-meteo.com",
 			Repo: "https://github.com/tamnd/geocodingmeteo-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `geocodingmeteo page` and
-	// `ant get geocodingmeteo://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// get: fetch one location by numeric ID (e.g. 2988507 for Paris).
+	// This is the resolver op that makes Location mint-able as a URI.
+	kit.Handle(app, kit.OpMeta{
+		Name:     "get",
+		Group:    "read",
+		Single:   true,
+		Resolver: true,
+		Summary:  "Fetch a location by its Open-Meteo numeric ID",
+		URIType:  "location",
+		Args:     []kit.Arg{{Name: "id", Help: "numeric location ID"}},
+	}, getLocation)
 
-	// List op: members of a page, the home of `geocodingmeteo links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// geocodingmeteo://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// search: list of Location records matching a city/place name.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "read",
+		List:    true,
+		Summary: "Search for a city or location by name",
+		Args:    []kit.Arg{{Name: "name", Help: "city or place name (or numeric ID)"}},
+	}, searchLocations)
 }
 
 // newClient builds the client from the host-resolved config, so a host and the
@@ -88,86 +90,92 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type getInput struct {
+	ID     string  `kit:"arg"  help:"numeric location ID"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Name     string  `kit:"arg"  help:"city or place name (or numeric ID)"`
+	Count    int     `kit:"flag" help:"maximum number of results" default:"10"`
+	Language string  `kit:"flag" help:"result language (ISO 639-1 code)" default:"en"`
+	Client   *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getLocation(ctx context.Context, in getInput, emit func(*Location) error) error {
+	locs, err := in.Client.Search(ctx, in.ID, 1, "en")
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	if len(locs) == 0 {
+		return errs.NotFound("location %s not found", in.ID)
+	}
+	return emit(locs[0])
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func searchLocations(ctx context.Context, in searchInput, emit func(*Location) error) error {
+	locs, err := in.Client.Search(ctx, in.Name, in.Count, in.Language)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, loc := range locs {
+		if err := emit(loc); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+// --- Resolver: URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full geocodingmeteo.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id) pair so
+// `ant resolve` and `ant url` touch no network.
+//
+// All-digits input is treated as a numeric location ID; everything else is a
+// query string.
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized geocodingmeteo reference: %q", input)
+	if input == "" {
+		return "", "", errs.Usage("empty geocodingmeteo reference")
 	}
-	return "page", id, nil
+	if isAllDigits(input) {
+		return "location", input, nil
+	}
+	return "query", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	base := DefaultConfig().BaseURL
+	switch uriType {
+	case "location":
+		return base + "/v1/search?name=" + id + "&count=1", nil
+	case "query":
+		return base + "/v1/search?name=" + id, nil
+	default:
 		return "", errs.Usage("geocodingmeteo has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// isAllDigits reports whether s consists entirely of ASCII decimal digits.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
 	}
-	return strings.Trim(input, "/")
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind that carries the
+// right exit code.
 func mapErr(err error) error {
 	return err
 }
