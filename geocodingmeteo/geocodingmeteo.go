@@ -1,38 +1,70 @@
 // Package geocodingmeteo is the library behind the geocodingmeteo command line:
-// the HTTP client, request shaping, and the typed data models for geocodingmeteo.
+// the HTTP client, request shaping, and the typed data models for the
+// Open-Meteo Geocoding API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client sets a real User-Agent, paces requests so a busy session stays
+// polite, and retries the transient failures (429 and 5xx) that any public API
+// throws under load. Build your endpoint calls and JSON decoding on top of it.
 package geocodingmeteo
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to geocodingmeteo. A real, honest
+// DefaultUserAgent identifies the client to Open-Meteo. A real, honest
 // User-Agent is both polite and the thing most likely to keep you unblocked.
 const DefaultUserAgent = "geocodingmeteo/dev (+https://github.com/tamnd/geocodingmeteo-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at geocodingmeteo.com; change it once you
-// know the real endpoints you want to read.
-const Host = "geocodingmeteo.com"
+// Host is the geocoding API hostname, used as the URI driver scheme host.
+const Host = "geocoding-api.open-meteo.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// Config holds per-client tuning knobs. DefaultConfig returns ready-to-use
+// values; a host may override individual fields.
+type Config struct {
+	BaseURL string
+	Rate    time.Duration
+	Retries int
+	Timeout time.Duration
+}
 
-// Client talks to geocodingmeteo over HTTP.
+// DefaultConfig returns production-safe defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL: "https://geocoding-api.open-meteo.com",
+		Rate:    0,
+		Retries: 3,
+		Timeout: 10 * time.Second,
+	}
+}
+
+// Location is one geocoding result: a city or named place returned by the
+// Open-Meteo Geocoding API. The kit:"id" tag makes ID the resource address.
+type Location struct {
+	ID          int     `kit:"id" json:"id"`
+	Name        string  `json:"name"`
+	Latitude    float64 `json:"latitude"`
+	Longitude   float64 `json:"longitude"`
+	Elevation   float64 `json:"elevation"`
+	Country     string  `json:"country"`
+	CountryCode string  `json:"country_code"`
+	Timezone    string  `json:"timezone"`
+	Population  int     `json:"population"`
+	Region      string  `json:"region"` // admin1
+	FeatureCode string  `json:"feature_code"`
+}
+
+// Client talks to the Open-Meteo Geocoding API over HTTPS.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +72,67 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with production-safe defaults derived from
+// DefaultConfig.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Search queries the geocoding API for places matching name. count controls
+// the maximum number of results; language is an ISO 639-1 code (e.g. "en").
+func (c *Client) Search(ctx context.Context, name string, count int, language string) ([]*Location, error) {
+	if count <= 0 {
+		count = 10
+	}
+	if language == "" {
+		language = "en"
+	}
+	q := url.Values{}
+	q.Set("name", name)
+	q.Set("count", strconv.Itoa(count))
+	q.Set("language", language)
+	q.Set("format", "json")
+	apiURL := c.BaseURL + "/v1/search?" + q.Encode()
+
+	body, err := c.Get(ctx, apiURL)
+	if err != nil {
+		return nil, err
+	}
+
+	var wire wireSearchResponse
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("decode search response: %w", err)
+	}
+
+	out := make([]*Location, 0, len(wire.Results))
+	for _, w := range wire.Results {
+		out = append(out, &Location{
+			ID:          w.ID,
+			Name:        w.Name,
+			Latitude:    w.Latitude,
+			Longitude:   w.Longitude,
+			Elevation:   w.Elevation,
+			Country:     w.Country,
+			CountryCode: w.CountryCode,
+			Timezone:    w.Timezone,
+			Population:  w.Population,
+			Region:      w.Admin1,
+			FeatureCode: w.FeatureCode,
+		})
+	}
+	return out, nil
+}
+
+// Get fetches url and returns the response body. It paces and retries
+// according to the client's settings. The caller owns the returned bytes.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +142,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +151,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -116,85 +194,26 @@ func (c *Client) pace() {
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
+	d := min(time.Duration(attempt)*500*time.Millisecond, 5*time.Second)
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on geocodingmeteo.com. It is a stand-in for the typed records you
-// will model from the real geocodingmeteo endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `geocodingmeteo cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types ---------------------------------------------------------------
+
+type wireSearchResponse struct {
+	Results []wireLocation `json:"results"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+type wireLocation struct {
+	ID          int     `json:"id"`
+	Name        string  `json:"name"`
+	Latitude    float64 `json:"latitude"`
+	Longitude   float64 `json:"longitude"`
+	Elevation   float64 `json:"elevation"`
+	FeatureCode string  `json:"feature_code"`
+	CountryCode string  `json:"country_code"`
+	Timezone    string  `json:"timezone"`
+	Population  int     `json:"population"`
+	Country     string  `json:"country"`
+	Admin1      string  `json:"admin1"`
 }
